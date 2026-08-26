@@ -8,10 +8,9 @@ sentence-transformers>=3.0
 flashrank>=0.2
 ragas>=0.1.10,<0.2
 langchain-community>=0.2,<0.3
-langchain-openai>=0.1,<0.2
+langchain-google-genai
 datasets>=2.19
-openai>=1.30
-
+pinecone
 # ── Day 24 new: LLM Judge ────────────────────────────────────────────────────
 scipy>=1.11                      # Cohen's κ calculation
 
@@ -23,3 +22,5 @@ nemoguardrails>=0.9              # NeMo Guardrails (topic + content rails via LL
 
 # After pip install, run:
 #   python -m spacy download en_core_web_lg
+
+pydantic<2                       # Fix NeMo Guardrails 0.11.0 RecursionError

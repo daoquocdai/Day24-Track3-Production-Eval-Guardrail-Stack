@@ -1,7 +1,7 @@
 models:
   - type: main
-    engine: openai
-    model: gpt-4o-mini
+    engine: google_genai
+    model: gemini-3.5-flash-lite
 
 instructions:
   - type: general

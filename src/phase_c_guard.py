@@ -87,6 +87,13 @@ def setup_nemo_rails():
         rails.co    — Colang dialogue flows (topic check, jailbreak check, output check)
     """
     from nemoguardrails import RailsConfig, LLMRails
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from nemoguardrails.llm.providers import register_llm_provider
+        register_llm_provider("google_genai", ChatGoogleGenerativeAI)
+    except Exception as e:
+        print(f"Warning: failed to register google_genai provider: {e}")
+        
     config = RailsConfig.from_path(GUARDRAILS_CONFIG_DIR)
     rails  = LLMRails(config)
     return rails

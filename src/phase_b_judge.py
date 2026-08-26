@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import OPENAI_API_KEY, JUDGE_MODEL, HUMAN_LABELS_PATH
+from config import GOOGLE_API_KEY, JUDGE_MODEL, HUMAN_LABELS_PATH
 
 
 @dataclass
@@ -55,18 +55,21 @@ def pairwise_judge(question: str, answer_a: str, answer_b: str) -> dict:
     # {{"winner": "A" hoặc "B" hoặc "tie", "reasoning": "giải thích ngắn gọn", "scores": {{"A": 0.0-1.0, "B": 0.0-1.0}}}}
     # '''
     #
-    # from openai import OpenAI
-    # client = OpenAI()
-    # resp = client.chat.completions.create(
-    #     model=JUDGE_MODEL,
-    #     messages=[
-    #         {"role": "system", "content": "Bạn là expert đánh giá RAG. Chỉ trả lời JSON."},
-    #         {"role": "user",   "content": PROMPT_TEMPLATE.format(
-    #             question=question, answer_a=answer_a, answer_b=answer_b)},
-    #     ],
-    #     response_format={"type": "json_object"},
-    # )
-    # return json.loads(resp.choices[0].message.content)
+    # from langchain_google_genai import ChatGoogleGenerativeAI
+    # from langchain_core.messages import SystemMessage, HumanMessage
+    # import re
+    # llm = ChatGoogleGenerativeAI(model=JUDGE_MODEL, temperature=0, max_retries=3)
+    # messages = [
+    #     SystemMessage(content="Bạn là expert đánh giá RAG. Chỉ trả lời JSON."),
+    #     HumanMessage(content=PROMPT_TEMPLATE.format(
+    #         question=question, answer_a=answer_a, answer_b=answer_b))
+    # ]
+    # resp = llm.invoke(messages)
+    # text = resp.content.strip()
+    # if text.startswith("```json"): text = text[7:]
+    # elif text.startswith("```"): text = text[3:]
+    # if text.endswith("```"): text = text[:-3]
+    # return json.loads(text.strip())
     return {"winner": "tie", "reasoning": "", "scores": {"A": 0.0, "B": 0.0}}
 
 
