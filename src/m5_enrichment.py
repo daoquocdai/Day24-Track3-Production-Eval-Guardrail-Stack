@@ -8,25 +8,13 @@ Làm giàu chunks TRƯỚC khi embed: Summarize, HyQA, Contextual Prepend, Auto 
 Test: pytest tests/test_m5.py
 """
 
+import json
 import os, sys
-from dataclasses import dataclass, field
-import json as _json
 import re
+from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import GOOGLE_API_KEY, GEMINI_MODEL
-
-_llm_client = None
-
-def _get_llm():
-    global _llm_client
-    if GOOGLE_API_KEY and _llm_client is None:
-        try:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            _llm_client = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0, max_retries=3)
-        except Exception as e:
-            print(f"  ⚠️  Failed to init Gemini: {e}")
-    return _llm_client
+from config import LLM_API_KEY, LLM_MODEL, MOCK_MODE, get_llm_client
 
 
 @dataclass
@@ -48,21 +36,11 @@ def summarize_chunk(text: str) -> str:
     Tạo summary ngắn cho chunk.
     Embed summary thay vì (hoặc cùng với) raw chunk → giảm noise.
     """
-    llm = _get_llm()
-    if llm:
-        try:
-            from langchain_core.messages import SystemMessage, HumanMessage
-            messages = [
-                SystemMessage(content="Tóm tắt đoạn văn sau trong 2-3 câu ngắn gọn bằng tiếng Việt."),
-                HumanMessage(content=text),
-            ]
-            resp = llm.invoke(messages)
-            return resp.content.strip()
-        except Exception as e:
-            print(f"  ⚠️  Gemini summarize failed: {e}")
-            
-    sentences = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
-    return ". ".join(sentences[:2]) + "." if sentences else text
+    result = _enrich_single_call(text, "")
+    if result.get("summary"):
+        return result["summary"]
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text.replace("\n", " ")) if s.strip()]
+    return " ".join(sentences[:2]) if sentences else text
 
 
 # ─── Technique 2: Hypothesis Question-Answer (HyQA) ─────
@@ -73,22 +51,12 @@ def generate_hypothesis_questions(text: str, n_questions: int = 3) -> list[str]:
     Generate câu hỏi mà chunk có thể trả lời.
     Index cả questions lẫn chunk → query match tốt hơn (bridge vocabulary gap).
     """
-    llm = _get_llm()
-    if llm:
-        try:
-            from langchain_core.messages import SystemMessage, HumanMessage
-            messages = [
-                SystemMessage(content=f"Dựa trên đoạn văn, tạo {n_questions} câu hỏi mà đoạn văn có thể trả lời. Trả về mỗi câu hỏi trên 1 dòng."),
-                HumanMessage(content=text),
-            ]
-            resp = llm.invoke(messages)
-            questions = resp.content.strip().split("\n")
-            return [q.strip().lstrip("0123456789.-) ") for q in questions if q.strip()][:n_questions]
-        except Exception as e:
-            print(f"  ⚠️  Gemini HyQA failed: {e}")
-
-    sentences = [s.strip() for s in re.split(r'[.!?\n]', text) if len(s.strip()) > 10]
-    return [f"{s.rstrip('.')}?" for s in sentences[:n_questions]]
+    result = _enrich_single_call(text, "")
+    questions = result.get("questions", [])
+    if questions:
+        return questions[:n_questions]
+    sentences = [s.strip() for s in re.split(r"[.!?\n]+", text) if len(s.strip()) > 10]
+    return [f"{sentence.rstrip('.')}?" for sentence in sentences[:n_questions]]
 
 
 # ─── Technique 3: Contextual Prepend (Anthropic style) ──
@@ -99,55 +67,18 @@ def contextual_prepend(text: str, document_title: str = "") -> str:
     Prepend context giải thích chunk nằm ở đâu trong document.
     Anthropic benchmark: giảm 49% retrieval failure (alone).
     """
-    llm = _get_llm()
-    if llm:
-        try:
-            from langchain_core.messages import SystemMessage, HumanMessage
-            messages = [
-                SystemMessage(content="Viết 1 câu ngắn mô tả đoạn văn này nằm ở đâu trong tài liệu và nói về chủ đề gì. Chỉ trả về 1 câu."),
-                HumanMessage(content=f"Tài liệu: {document_title}\n\nĐoạn văn:\n{text}"),
-            ]
-            resp = llm.invoke(messages)
-            context = resp.content.strip()
-            return f"{context}\n\n{text}"
-        except Exception as e:
-            print(f"  ⚠️  Gemini contextual failed: {e}")
-
-    prefix = f"Trích từ {document_title}. " if document_title else ""
-    return f"{prefix}{text}"
+    context = _enrich_single_call(text, document_title).get("context", "")
+    return f"{context}\n\n{text}" if context else text
 
 
 # ─── Technique 4: Auto Metadata Extraction ──────────────
-
-def _parse_json_robust(text: str) -> dict:
-    text = text.strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    elif text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    return _json.loads(text.strip())
 
 
 def extract_metadata(text: str) -> dict:
     """
     LLM extract metadata tự động: topic, entities, date_range, category.
     """
-    llm = _get_llm()
-    if llm:
-        try:
-            from langchain_core.messages import SystemMessage, HumanMessage
-            messages = [
-                SystemMessage(content='Trích xuất metadata từ đoạn văn. Trả về JSON: {"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi|en"}. Trả về CHỈ JSON.'),
-                HumanMessage(content=text),
-            ]
-            resp = llm.invoke(messages)
-            return _parse_json_robust(resp.content)
-        except Exception as e:
-            print(f"  ⚠️  Gemini metadata failed: {e}")
-
-    return {"topic": "general", "entities": [], "category": "policy", "language": "vi"}
+    return _enrich_single_call(text, "").get("metadata", {})
 
 
 # ─── Combined Single-Call Mode ───────────────────────────
@@ -158,39 +89,67 @@ def _enrich_single_call(text: str, source: str) -> dict:
 
     ⚠️ Cost optimization: 1 API call thay vì 4 calls riêng lẻ.
     """
-    llm = _get_llm()
-    if llm:
-        try:
-            from langchain_core.messages import SystemMessage, HumanMessage
-            messages = [
-                SystemMessage(content='''Phân tích đoạn văn và trả về JSON:
+    if MOCK_MODE or not LLM_API_KEY or not text.strip():
+        return {}
+
+    system_prompt = """Bạn làm giàu chunk cho hệ thống RAG tiếng Việt.
+Chỉ trả về một JSON object hợp lệ, không Markdown, theo schema:
 {
-  "summary": "tóm tắt 2-3 câu",
-  "questions": ["câu hỏi 1", "câu hỏi 2", "câu hỏi 3"],
-  "context": "1 câu mô tả đoạn văn nằm ở đâu trong tài liệu",
-  "metadata": {"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi|en"}
+  "summary": "Tóm tắt chính xác nội dung chunk trong 1-2 câu",
+  "questions": ["2-3 câu hỏi mà chunk có thể trả lời"],
+  "context": "Một câu nêu chunk thuộc phần/ngữ cảnh nào của tài liệu",
+  "metadata": {
+    "topic": "chủ đề chính",
+    "keywords": ["từ khóa chính"],
+    "entities": ["thực thể quan trọng"],
+    "category": "policy|hr|it|finance|safety|compliance|general",
+    "language": "vi|en"
+  }
 }
-CHỈ TRẢ VỀ JSON, không markdown format.'''),
-                HumanMessage(content=f"Tài liệu: {source}\n\nĐoạn văn:\n{text}"),
-            ]
-            resp = llm.invoke(messages)
-            return _parse_json_robust(resp.content)
-        except Exception as e:
-            print(f"  ⚠️  Enrichment API failed: {e}")
-            
-    sentences = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
-    summary = ". ".join(sentences[:2]) + "." if sentences else text
-    
-    long_sentences = [s.strip() for s in re.split(r'[.!?\n]', text) if len(s.strip()) > 10]
-    questions = [f"{s.rstrip('.')}?" for s in long_sentences[:3]]
-    
-    prefix = f"Trích từ {source}. " if source else ""
-    
+Không suy diễn thông tin không xuất hiện trong chunk hoặc ngữ cảnh tài liệu."""
+
+    try:
+        client = get_llm_client()
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Ngữ cảnh tài liệu: {source or 'Không cung cấp'}\n\nChunk:\n{text}"},
+            ],
+            temperature=0,
+            max_tokens=400,
+        )
+        content = response.choices[0].message.content or ""
+        return _normalize_enrichment(_parse_json_object(content))
+    except Exception as error:
+        print(f"  ⚠️  Enrichment API failed; dùng chunk gốc: {error}")
+        return {}
+
+
+def _parse_json_object(content: str) -> dict:
+    """Parse JSON and tolerate an accidental Markdown code fence."""
+    content = content.strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE)
+    value = json.loads(content)
+    if not isinstance(value, dict):
+        raise ValueError("Enrichment response must be a JSON object")
+    return value
+
+
+def _normalize_enrichment(value: dict) -> dict:
+    """Validate LLM-shaped data before it reaches indexing metadata."""
+    summary = value.get("summary", "")
+    context = value.get("context", value.get("contextual_info", ""))
+    questions = value.get("questions", value.get("hypothetical_questions", []))
+    metadata = value.get("metadata", value.get("keywords_metadata", {}))
     return {
-        "summary": summary,
-        "questions": questions,
-        "context": prefix,
-        "metadata": {"topic": "general", "entities": [], "category": "policy", "language": "vi"}
+        "summary": summary.strip() if isinstance(summary, str) else "",
+        "questions": [q.strip() for q in questions[:3] if isinstance(q, str) and q.strip()]
+        if isinstance(questions, list) else [],
+        "context": context.strip() if isinstance(context, str) else "",
+        "metadata": metadata if isinstance(metadata, dict) else {},
     }
 
 

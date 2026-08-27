@@ -10,6 +10,8 @@ Test: pytest tests/test_m1.py
 """
 
 import os, sys, glob, re
+import hashlib
+from functools import lru_cache
 from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,7 +28,11 @@ class Chunk:
 
 def _extract_pdf_text(path: str) -> str:
     """Extract text layer từ PDF. Trả về "" nếu PDF là scan ảnh (không có text)."""
-    from pypdf import PdfReader
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        print(f"  ⚠️  Bỏ qua {os.path.basename(path)}: chưa cài pypdf.")
+        return ""
 
     reader = PdfReader(path)
     pages = [page.extract_text() or "" for page in reader.pages]
@@ -87,43 +93,51 @@ def chunk_semantic(text: str, threshold: float = SEMANTIC_THRESHOLD,
     Split text by sentence similarity — nhóm câu cùng chủ đề.
     Tốt hơn basic vì không cắt giữa ý.
     """
-    if not text.strip():
-        return []
-        
-    from sentence_transformers import SentenceTransformer
-    from numpy import dot
-    from numpy.linalg import norm
-    import re
-    
     metadata = metadata or {}
-    
-    raw_sentences = re.split(r'(?<=[.!?])\s+|\n\n', text)
-    sentences = [s.strip() for s in raw_sentences if s.strip()]
-    
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n\s*\n+", text.strip()) if s.strip()]
     if not sentences:
         return []
-        
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    embeddings = model.encode(sentences)
-    
-    chunks = []
-    current_chunk = [sentences[0]]
-    
+
+    embeddings = _sentence_embeddings(sentences)
+    groups: list[list[str]] = [[sentences[0]]]
     for i in range(1, len(sentences)):
-        a = embeddings[i-1]
-        b = embeddings[i]
-        sim = dot(a, b) / (norm(a) * norm(b) + 1e-9)
-        
-        if sim < threshold:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [sentences[i]]
+        if _cosine_similarity(embeddings[i - 1], embeddings[i]) < threshold:
+            groups.append([sentences[i]])
         else:
-            current_chunk.append(sentences[i])
-            
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-        
-    return [Chunk(text=c, metadata={**metadata, "strategy": "semantic"}) for c in chunks if c.strip()]
+            groups[-1].append(sentences[i])
+
+    return [Chunk(" ".join(group), {**metadata, "strategy": "semantic", "chunk_index": i})
+            for i, group in enumerate(groups)]
+
+
+@lru_cache(maxsize=1)
+def _semantic_model():
+    """Load the sentence embedding model only once."""
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+def _sentence_embeddings(sentences: list[str]):
+    try:
+        return _semantic_model().encode(sentences, normalize_embeddings=True)
+    except Exception:
+        # Offline fallback: hashed bag-of-words vectors still provide cosine-based
+        # boundaries when sentence-transformers or the model is unavailable.
+        vectors = []
+        for sentence in sentences:
+            vector = [0.0] * 384
+            for token in re.findall(r"\w+", sentence.casefold(), flags=re.UNICODE):
+                digest = hashlib.blake2b(token.encode("utf-8"), digest_size=4).digest()
+                vector[int.from_bytes(digest, "big") % len(vector)] += 1.0
+            vectors.append(vector)
+        return vectors
+
+
+def _cosine_similarity(a, b) -> float:
+    dot_product = sum(float(x) * float(y) for x, y in zip(a, b))
+    norm_a = sum(float(x) ** 2 for x in a) ** 0.5
+    norm_b = sum(float(y) ** 2 for y in b) ** 0.5
+    return dot_product / (norm_a * norm_b + 1e-9)
 
 
 # ─── Strategy 2: Hierarchical Chunking ──────────────────
@@ -139,53 +153,57 @@ def chunk_hierarchical(text: str, parent_size: int = HIERARCHICAL_PARENT_SIZE,
     Returns:
         (parents, children) — mỗi child có parent_id link đến parent.
     """
-    import re
     metadata = metadata or {}
-    parents = []
-    children = []
-    
+    if parent_size <= 0 or child_size <= 0:
+        raise ValueError("parent_size and child_size must be positive")
     if not text.strip():
-        return parents, children
-        
-    def split_to_chunks(txt, max_size):
-        paras = [p.strip() for p in txt.split('\n\n') if p.strip()]
-        res = []
-        cur = ""
-        for p in paras:
-            if len(cur) + len(p) > max_size and cur:
-                res.append(cur.strip())
-                cur = p + "\n\n"
-            else:
-                cur += p + "\n\n"
-        if cur.strip():
-            res.append(cur.strip())
-        return res
+        return [], []
 
-    parent_texts = split_to_chunks(text, parent_size)
-    
-    for i, p_text in enumerate(parent_texts):
-        pid = f"parent_{i}_{hash(p_text)}"
-        parents.append(Chunk(text=p_text, metadata={**metadata, "chunk_type": "parent", "parent_id": pid}, parent_id=pid))
-        
-        child_texts = split_to_chunks(p_text, child_size)
-        
-        for c_text in child_texts:
-            if len(c_text) > child_size:
-                sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', c_text) if s.strip()]
-                c_cur = ""
-                for s in sentences:
-                    if len(c_cur) + len(s) > child_size and c_cur:
-                        children.append(Chunk(text=c_cur.strip(), metadata={**metadata, "chunk_type": "child"}, parent_id=pid))
-                        c_cur = s + " "
-                    else:
-                        c_cur += s + " "
-                if c_cur.strip():
-                    children.append(Chunk(text=c_cur.strip(), metadata={**metadata, "chunk_type": "child"}, parent_id=pid))
-            else:
-                if c_text.strip():
-                    children.append(Chunk(text=c_text.strip(), metadata={**metadata, "chunk_type": "child"}, parent_id=pid))
-                    
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+    parent_texts = _pack_blocks(paragraphs, parent_size)
+    parents: list[Chunk] = []
+    children: list[Chunk] = []
+    source = str(metadata.get("source", "document"))
+    document_key = hashlib.sha1(source.encode("utf-8")).hexdigest()[:10]
+
+    for parent_index, parent_text in enumerate(parent_texts):
+        parent_id = f"parent_{document_key}_{parent_index}"
+        parent_meta = {**metadata, "chunk_type": "parent", "chunk_index": parent_index,
+                       "parent_id": parent_id}
+        parents.append(Chunk(parent_text, parent_meta, parent_id))
+
+        for child_text in _pack_blocks(re.split(r"\n\s*\n+", parent_text), child_size):
+            child_meta = {**metadata, "chunk_type": "child", "chunk_index": len(children),
+                          "parent_id": parent_id}
+            children.append(Chunk(child_text, child_meta, parent_id))
     return parents, children
+
+
+def _pack_blocks(blocks: list[str], max_size: int) -> list[str]:
+    """Pack blocks up to max_size and safely split a single oversized block."""
+    normalized: list[str] = []
+    for block in blocks:
+        block = block.strip()
+        while len(block) > max_size:
+            split_at = block.rfind(" ", 0, max_size + 1)
+            split_at = split_at if split_at > 0 else max_size
+            normalized.append(block[:split_at].strip())
+            block = block[split_at:].strip()
+        if block:
+            normalized.append(block)
+
+    packed: list[str] = []
+    current = ""
+    for block in normalized:
+        candidate = f"{current}\n\n{block}" if current else block
+        if current and len(candidate) > max_size:
+            packed.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        packed.append(current)
+    return packed
 
 
 # ─── Strategy 3: Structure-Aware Chunking ────────────────
@@ -196,33 +214,30 @@ def chunk_structure_aware(text: str, metadata: dict | None = None) -> list[Chunk
     Parse markdown headers → chunk theo logical structure.
     Giữ nguyên tables, code blocks, lists — không cắt giữa chừng.
     """
+    metadata = metadata or {}
     if not text.strip():
         return []
-    import re
-    metadata = metadata or {}
-    
-    sections = re.split(r'(^#{1,3}\s+.+$)', text, flags=re.MULTILINE)
-    
-    chunks = []
-    current_header = ""
-    current_content = ""
-    
-    for part in sections:
-        if re.match(r'^#{1,3}\s+', part):
-            if current_content.strip() or current_header:
-                chunk_text = (current_header + "\n" + current_content).strip()
-                if chunk_text:
-                    chunks.append(Chunk(text=chunk_text, metadata={**metadata, "section": current_header.strip(), "strategy": "structure"}))
-            current_header = part.strip()
-            current_content = ""
-        else:
-            current_content += part
-            
-    if current_content.strip() or current_header:
-        chunk_text = (current_header + "\n" + current_content).strip()
-        if chunk_text:
-            chunks.append(Chunk(text=chunk_text, metadata={**metadata, "section": current_header.strip(), "strategy": "structure"}))
-            
+
+    pattern = re.compile(r"^(#{1,3})\s+(.+?)\s*$", re.MULTILINE)
+    matches = list(pattern.finditer(text))
+    chunks: list[Chunk] = []
+    preamble_end = matches[0].start() if matches else len(text)
+    preamble = text[:preamble_end].strip()
+    if preamble:
+        chunks.append(Chunk(preamble, {**metadata, "section": "preamble",
+                                      "strategy": "structure", "chunk_index": 0}))
+
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        chunks.append(Chunk(
+            text[match.start():end].strip(),
+            {**metadata, "section": match.group(2).strip(),
+             "heading_level": len(match.group(1)), "strategy": "structure",
+             "chunk_index": len(chunks)},
+        ))
+    if not matches and not chunks:
+        chunks.append(Chunk(text.strip(), {**metadata, "section": "document",
+                                          "strategy": "structure", "chunk_index": 0}))
     return chunks
 
 

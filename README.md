@@ -30,7 +30,7 @@ Sau lab này, các bạn sẽ có một **complete eval + guardrail stack** có 
 - Đã hoàn thành **Lab 18** (các module M1–M5 + pipeline.py đã chạy được)
 - Python 3.11+
 - Docker (chạy Qdrant)
-- OpenAI API key
+- Google API key (Gemini)
 
 ---
 
@@ -55,7 +55,7 @@ docker compose up -d                      # Khởi động Qdrant
 pip install -r requirements.txt
 python -m spacy download en_core_web_lg   # Cần cho Presidio PII detection
 
-cp .env.example .env                      # Điền OPENAI_API_KEY vào .env
+cp .env.example .env                      # Điền GOOGLE_API_KEY vào .env
 ```
 
 ### Bước 3: Generate answers (quan trọng!)

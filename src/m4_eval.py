@@ -3,10 +3,20 @@ from __future__ import annotations
 """Module 4: RAGAS Evaluation — 4 metrics + failure analysis."""
 
 import os, sys, json
+import math
+import re
 from dataclasses import dataclass
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import TEST_SET_PATH
+from config import LLM_API_KEY, MOCK_MODE, TEST_SET_PATH
+
+
+METRIC_NAMES = ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
 
 
 @dataclass
@@ -30,113 +40,166 @@ def load_test_set(path: str = TEST_SET_PATH) -> list[dict]:
 def evaluate_ragas(questions: list[str], answers: list[str],
                    contexts: list[list[str]], ground_truths: list[str]) -> dict:
     """Run RAGAS evaluation."""
-    zeros = {"faithfulness": 0.0, "answer_relevancy": 0.0,
-             "context_precision": 0.0, "context_recall": 0.0, "per_question": []}
-             
+    lengths = {len(questions), len(answers), len(contexts), len(ground_truths)}
+    if len(lengths) != 1:
+        raise ValueError("questions, answers, contexts and ground_truths must have equal lengths")
+    fallback = _fallback_results(questions, answers, contexts, ground_truths)
+    if not questions:
+        return fallback
+    if MOCK_MODE:
+        print("  ⚠️  RAG mock mode; dùng offline proxy metrics thay cho model-backed RAGAS.")
+        return fallback
+    if not LLM_API_KEY:
+        print("  ⚠️  Không có API key; dùng offline proxy metrics thay cho model-backed RAGAS.")
+        return fallback
+
     try:
-        from ragas import evaluate
-        from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
         from datasets import Dataset
-        import pandas as pd
-        import numpy as np
-        
-        from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-        from config import GEMINI_MODEL
-        
-        llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0, max_retries=3)
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        
+        from ragas import evaluate
+        from ragas.metrics import (answer_relevancy, context_precision,
+                                   context_recall, faithfulness)
+
         dataset = Dataset.from_dict({
             "question": questions,
             "answer": answers,
             "contexts": contexts,
             "ground_truth": ground_truths,
         })
-        
-        result = evaluate(dataset, metrics=[faithfulness, answer_relevancy,
-                                            context_precision, context_recall],
-                          llm=llm, embeddings=embeddings)
-                                            
-        df = result.to_pandas()
-        
+        evaluation = evaluate(
+            dataset,
+            metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
+        )
+        frame = evaluation.to_pandas()
         per_question = []
-        for _, row in df.iterrows():
-            f = float(row.get("faithfulness", 0.0))
-            ar = float(row.get("answer_relevancy", 0.0))
-            cp = float(row.get("context_precision", 0.0))
-            cr = float(row.get("context_recall", 0.0))
-            
+        for _, row in frame.iterrows():
             per_question.append(EvalResult(
-                question=row["question"],
-                answer=row["answer"],
-                contexts=row["contexts"],
-                ground_truth=row["ground_truth"],
-                faithfulness=f if not np.isnan(f) else 0.0,
-                answer_relevancy=ar if not np.isnan(ar) else 0.0,
-                context_precision=cp if not np.isnan(cp) else 0.0,
-                context_recall=cr if not np.isnan(cr) else 0.0
+                question=str(row["question"]),
+                answer=str(row["answer"]),
+                contexts=list(row["contexts"]),
+                ground_truth=str(row["ground_truth"]),
+                **{name: _safe_score(row.get(name, 0.0)) for name in METRIC_NAMES},
             ))
-            
-        f_agg = result.get("faithfulness", 0.0)
-        ar_agg = result.get("answer_relevancy", 0.0)
-        cp_agg = result.get("context_precision", 0.0)
-        cr_agg = result.get("context_recall", 0.0)
-        
-        return {
-            "faithfulness": float(f_agg) if not np.isnan(f_agg) else 0.0,
-            "answer_relevancy": float(ar_agg) if not np.isnan(ar_agg) else 0.0,
-            "context_precision": float(cp_agg) if not np.isnan(cp_agg) else 0.0,
-            "context_recall": float(cr_agg) if not np.isnan(cr_agg) else 0.0,
-            "per_question": per_question
+        aggregates = {
+            name: (sum(getattr(item, name) for item in per_question) / len(per_question)
+                   if per_question else 0.0)
+            for name in METRIC_NAMES
         }
-        
-    except Exception as e:
-        print(f"  ⚠️  RAGAS evaluation failed: {e}")
-        return zeros
+        return {**aggregates, "per_question": per_question}
+    except Exception as error:
+        print(f"  ⚠️  RAGAS evaluation failed; dùng offline proxy metrics: {error}")
+        return fallback
 
 
-def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10) -> list[dict]:
-    """Analyze bottom-N worst questions using Diagnostic Tree."""
-    diagnostic_tree = {
-        "faithfulness": ("LLM hallucinating", "Tighten prompt, lower temperature"),
-        "context_recall": ("Missing relevant chunks", "Improve chunking or add BM25"),
-        "context_precision": ("Too many irrelevant chunks", "Add reranking or metadata filter"),
-        "answer_relevancy": ("Answer doesn't match question", "Improve prompt template"),
+def _safe_score(value) -> float:
+    try:
+        score = float(value)
+        return score if math.isfinite(score) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fallback_results(questions, answers, contexts, ground_truths) -> dict:
+    """Compute deterministic lexical proxies when model-backed RAGAS is unavailable."""
+    per_question = []
+    for question, answer, item_contexts, ground_truth in zip(
+            questions, answers, contexts, ground_truths):
+        answer_tokens = _content_tokens(answer)
+        question_tokens = _content_tokens(question)
+        truth_tokens = _content_tokens(ground_truth)
+        context_tokens = _content_tokens(" ".join(item_contexts))
+        relevant_contexts = sum(
+            bool(_content_tokens(context) & (question_tokens | truth_tokens))
+            for context in item_contexts
+        )
+        per_question.append(EvalResult(
+            question, answer, list(item_contexts), ground_truth,
+            _coverage(answer_tokens, context_tokens),
+            _f1(answer_tokens, question_tokens | truth_tokens),
+            relevant_contexts / len(item_contexts) if item_contexts else 0.0,
+            _coverage(truth_tokens, context_tokens),
+        ))
+    aggregates = {
+        name: (sum(getattr(item, name) for item in per_question) / len(per_question)
+               if per_question else 0.0)
+        for name in METRIC_NAMES
     }
-    
-    if not eval_results:
+    return {**aggregates, "per_question": per_question, "evaluation_mode": "offline_proxy"}
+
+
+_STOPWORDS = {
+    "và", "là", "có", "được", "cho", "của", "trong", "khi", "với", "một",
+    "nhân", "viên", "theo", "thì", "này", "đó", "về", "bao", "nhiêu", "cần",
+    "phải", "không", "từ", "đến", "các", "the", "a", "an", "of", "to", "and",
+}
+
+
+def _content_tokens(text: str) -> set[str]:
+    return {token for token in re.findall(r"\w+", text.casefold(), flags=re.UNICODE)
+            if len(token) > 1 and token not in _STOPWORDS}
+
+
+def _coverage(expected: set[str], available: set[str]) -> float:
+    return len(expected & available) / len(expected) if expected else 0.0
+
+
+def _f1(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    overlap = len(left & right)
+    precision, recall = overlap / len(left), overlap / len(right)
+    return 2 * precision * recall / (precision + recall) if overlap else 0.0
+
+
+def failure_analysis(eval_results: list[EvalResult], bottom_n: int = 10,
+                     threshold: float = 0.7) -> list[dict]:
+    """Analyze bottom-N worst questions using Diagnostic Tree."""
+    if bottom_n <= 0:
         return []
-        
-    analyzed = []
-    for res in eval_results:
-        metrics = {
-            "faithfulness": res.faithfulness,
-            "answer_relevancy": res.answer_relevancy,
-            "context_precision": res.context_precision,
-            "context_recall": res.context_recall
-        }
-        
-        avg_score = sum(metrics.values()) / 4.0
-        worst_metric = min(metrics, key=metrics.get)
-        worst_score = metrics[worst_metric]
-        
-        diag, fix = diagnostic_tree[worst_metric]
-        
-        analyzed.append({
-            "question": res.question,
+    diagnostic_tree = {
+        "context_recall": (
+            "retrieval",
+            "Thiếu chunk chứa thông tin cần thiết (retrieval miss).",
+            "Điều chỉnh kích thước chunk; bổ sung BM25/query expansion và tăng candidate top-k.",
+        ),
+        "context_precision": (
+            "retrieval",
+            "Các chunk không liên quan được xếp quá cao hoặc reranker lọc nhầm.",
+            "Tối ưu hybrid weights/RRF; thêm metadata filter và kiểm tra CrossEncoder reranking.",
+        ),
+        "faithfulness": (
+            "generation",
+            "Câu trả lời chứa thông tin không được context hỗ trợ (hallucination).",
+            "Siết prompt chỉ trả lời từ context, giảm temperature và yêu cầu trích dẫn bằng chứng.",
+        ),
+        "answer_relevancy": (
+            "generation",
+            "Câu trả lời không đúng trọng tâm hoặc diễn giải thừa.",
+            "Cải thiện prompt theo câu hỏi, yêu cầu câu trả lời trực tiếp và giới hạn độ dài.",
+        ),
+    }
+
+    ranked = []
+    for result in eval_results:
+        scores = {name: _safe_score(getattr(result, name)) for name in METRIC_NAMES}
+        average = sum(scores.values()) / len(scores)
+        if average >= threshold:
+            continue
+        worst_metric = min(scores, key=scores.get)
+        failure_type, diagnosis, suggested_fix = diagnostic_tree[worst_metric]
+        ranked.append((average, {
+            "question": result.question,
+            "expected": result.ground_truth,
+            "got": result.answer,
+            "contexts": result.contexts,
+            "failure_type": failure_type,
             "worst_metric": worst_metric,
-            "score": worst_score,
-            "avg_score": avg_score,
-            "diagnosis": diag,
-            "suggested_fix": fix
-        })
-        
-    analyzed.sort(key=lambda x: x["avg_score"])
-    
-    for a in analyzed:
-        a.pop("avg_score", None)
-        
-    return analyzed[:bottom_n]
+            "score": scores[worst_metric],
+            "average_score": average,
+            "diagnosis": diagnosis,
+            "suggested_fix": suggested_fix,
+        }))
+    ranked.sort(key=lambda item: item[0])
+    return [failure for _, failure in ranked[:bottom_n]]
 
 
 def save_report(results: dict, failures: list[dict], path: str = "ragas_report.json"):

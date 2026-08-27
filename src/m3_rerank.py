@@ -3,10 +3,12 @@ from __future__ import annotations
 """Module 3: Reranking — Cross-encoder top-20 → top-3 + latency benchmark."""
 
 import os, sys, time
+import re
+from numbers import Real
 from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import RERANK_TOP_K
+from config import MOCK_MODE, RERANK_TOP_K
 
 
 @dataclass
@@ -18,71 +20,58 @@ class RerankResult:
     rank: int
 
 
-import os
-from pinecone import Pinecone, PineconeException
-
 class CrossEncoderReranker:
-    def __init__(self, model_name: str = "bge-reranker-v2-m3"):
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3"):
         self.model_name = model_name
-        self._pc = None
+        self._model = None
 
-    def _get_client(self):
-        if self._pc is None:
-            api_key = os.environ.get("PINECONE_API_KEY")
-            if not api_key:
-                raise ValueError("PINECONE_API_KEY environment variable is missing")
-            self._pc = Pinecone(api_key=api_key)
-        return self._pc
+    def _load_model(self):
+        if self._model is None:
+            from sentence_transformers import CrossEncoder
+            self._model = CrossEncoder(self.model_name)
+        return self._model
 
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
-        """Rerank documents: top-20 -> top-k."""
-        if not documents:
+        """Rerank documents: top-20 → top-k."""
+        if not documents or top_k <= 0:
             return []
-            
-        pc = self._get_client()
-        docs_texts = [doc["text"] for doc in documents]
-        
+
+        pairs = [(query, str(document.get("text", ""))) for document in documents]
         try:
-            res = pc.inference.rerank(
-                model=self.model_name,
-                query=query,
-                documents=docs_texts,
-                top_n=len(documents), # Get all, we will truncate to top_k later to be safe, or we can just pass top_k
-                return_documents=True
-            )
-        except PineconeException as e:
-            err_msg = str(e).replace(os.environ.get("PINECONE_API_KEY", "NOT_SET"), "****")
-            raise RuntimeError(f"Pinecone API failed: {type(e).__name__} - {err_msg}")
-        except Exception as e:
-            err_msg = str(e).replace(os.environ.get("PINECONE_API_KEY", "NOT_SET"), "****")
-            raise RuntimeError(f"Pinecone inference error: {type(e).__name__} - {err_msg}")
-            
-        items = res.data
-        # Ensure it's sorted by score descending
-        try:
-            items.sort(key=lambda x: x["score"], reverse=True)
-        except TypeError: # if object
-            items.sort(key=lambda x: x.score, reverse=True)
-        
-        results = []
-        for i, item in enumerate(items[:top_k]):
-            if isinstance(item, dict):
-                idx = item["index"]
-                score = float(item["score"])
+            if MOCK_MODE:
+                raise RuntimeError("mock mode")
+            scores = self._load_model().predict(pairs)
+            if isinstance(scores, Real) or getattr(scores, "ndim", 1) == 0:
+                scores = [float(scores)]
             else:
-                idx = item.index
-                score = float(item.score)
-                
-            original_doc = documents[idx]
-            results.append(RerankResult(
-                text=original_doc["text"],
-                original_score=original_doc.get("score", 0.0),
-                rerank_score=score,
-                metadata=original_doc.get("metadata", {}),
-                rank=i
-            ))
-            
-        return results
+                scores = [float(score) for score in scores]
+        except Exception as error:
+            # Keep the retrieval pipeline usable when the model cannot be downloaded
+            # or loaded. This fallback is deterministic and clearly lower fidelity.
+            if not MOCK_MODE:
+                print(f"  ⚠️  CrossEncoder unavailable; dùng lexical fallback: {error}")
+            scores = [_lexical_score(query, document.get("text", "")) for document in documents]
+
+        scored = sorted(zip(scores, documents), key=lambda item: item[0], reverse=True)
+        return [
+            RerankResult(
+                text=str(document.get("text", "")),
+                original_score=float(document.get("score", 0.0)),
+                rerank_score=float(score),
+                metadata=dict(document.get("metadata", {})),
+                rank=rank,
+            )
+            for rank, (score, document) in enumerate(scored[:top_k], start=1)
+        ]
+
+
+def _lexical_score(query: str, text: str) -> float:
+    """Token-overlap fallback used only if CrossEncoder is unavailable."""
+    query_tokens = set(re.findall(r"\w+", query.casefold(), flags=re.UNICODE))
+    text_tokens = set(re.findall(r"\w+", text.casefold(), flags=re.UNICODE))
+    if not query_tokens:
+        return 0.0
+    return len(query_tokens & text_tokens) / len(query_tokens)
 
 
 class FlashrankReranker:
@@ -91,10 +80,22 @@ class FlashrankReranker:
         self._model = None
 
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
-        # TODO (optional): from flashrank import Ranker, RerankRequest
-        # model = Ranker(); passages = [{"text": d["text"]} for d in documents]
-        # results = model.rerank(RerankRequest(query=query, passages=passages))
-        return []
+        if not documents or top_k <= 0:
+            return []
+        from flashrank import Ranker, RerankRequest
+        if self._model is None:
+            self._model = Ranker()
+        passages = [{"id": index, "text": document.get("text", ""),
+                     "meta": document.get("metadata", {})}
+                    for index, document in enumerate(documents)]
+        results = self._model.rerank(RerankRequest(query=query, passages=passages))[:top_k]
+        return [RerankResult(
+            text=result["text"],
+            original_score=float(documents[int(result["id"])].get("score", 0.0)),
+            rerank_score=float(result["score"]),
+            metadata=dict(documents[int(result["id"])].get("metadata", {})),
+            rank=rank,
+        ) for rank, result in enumerate(results, start=1)]
 
 
 def benchmark_reranker(reranker, query: str, documents: list[dict], n_runs: int = 5) -> dict:
